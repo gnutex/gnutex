@@ -1,0 +1,49 @@
+{
+  "date": "2024-08-30",
+  "displayDate": "Friday, August 30",
+  "id": "10000",
+  "palette": [
+    "#bccde0"
+  ],
+  "puzzleConstructor": "Droopy Doggg",
+  "shapes": [
+    {
+      "color": "0",
+      "vertices": [
+        0,
+        1,
+        2
+      ]
+    }
+  ],
+  "theme": "Pointy",
+  "vertices": {
+    "0": {
+      "coordinates": [
+        1000,
+        0
+      ],
+      "shapes": [
+        "0"
+      ]
+    },
+    "1": {
+      "coordinates": [
+        1010,
+        0
+      ],
+      "shapes": [
+        "0"
+      ]
+    },
+    "2": {
+      "coordinates": [
+        1010,
+        100
+      ],
+      "shapes": [
+        "0"
+      ]
+    }
+  }
+}

@@ -1,0 +1,843 @@
+<!doctype html>
+<html>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+    body {
+        overscroll-behavior: none
+    }
+    canvas {
+        -webkit-user-select: none;
+        user-select: none;
+        position: absolute;
+        top: 0px;
+        width: 100%;
+        height: 100%;
+        overscroll-behavior: none;
+        touch-action: none; /* prevents pinch from causing safari tab selection */
+    }
+    #puzzleTheme {
+        text-align: center;
+    }
+    #topPanel {
+        display: flex;
+        flex-direction: column;
+        align-items: left;
+        justify-content: left;
+        position: absolute;
+        left: 40px;
+        top: 20px;
+    }
+
+    #zoomPanel {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        position: absolute;
+        right: 40px;
+        bottom: 75px;
+    }
+    button {
+        z-index: 1000;
+        font-family: mono;
+    }
+    select {
+        position: relative;
+        z-index: 1000;
+    
+    .zoomPanelElem {
+        width: 100%;
+    }
+</style>
+
+<body>
+    <!-- <div id="debugger">debugger</div> -->
+    <div id="topPanel">
+        <div id="puzzleSelectorDiv"></div>
+        <div id="puzzleTheme"></div>
+        <button id="resetPuzzle">Reset</button>
+    </div>
+    <canvas id="myCanvas"></canvas>
+    <!--
+    <div id="zoomPanel">
+        <button class="zoomPanelElem" id="zoomInBtn"> ✚ </button>
+        <button class="zoomPanelElem" id="zoom100"> 〇 </botton>
+        <button class="zoomPanelElem" id="zoomOutBtn"> − </button>
+    </div>
+    -->
+<script>
+
+const magnetDistance = 40;
+let vertices, shapes, palette;
+let completedShapeKeys;
+let connections;
+let offset = [0, 0];
+let oldOffset = [0, 0];
+let scale = 1;
+let defaultScale = 1;
+let defaultOffset;
+let overVIndex;
+const canvas = document.getElementById('myCanvas');
+const ctx = canvas.getContext('2d');
+let pan = false;
+let connect = false;
+let remove = false;
+let panOrigin = null; // where the cursor started on a pan
+let pointerCoord = null; // where the cursor currently is (not calced during pan, but only because it would have no effect)
+let connectStartVIndex; // which vertex started on a connect
+let lastTapVertex;
+let lastTapTime = Date.now() - 10000;
+let lastTouchDistance = null;
+let puzzlePath = ""; // for saving and loading state
+
+
+
+function distance(coord1, coord2) {
+    return Math.sqrt(Math.pow(coord1[0] - coord2[0], 2) + Math.pow(coord1[1] - coord2[1], 2));
+}
+
+function findNearestVertex(coord) {
+    let minD = null;
+    let nearestIndex = null;
+    Object.entries(vertices).forEach(([vIndex, vertex]) => {
+        const d = distance(coord, vertex.coordinates);
+        const hasRemovable = getRemovableConnections(Number(vIndex)).length != 0;
+        const selectable = vertex.freeEdges || hasRemovable; 
+        if (selectable && ( (minD === null) || (d < minD))) {
+            nearestIndex = vIndex;
+            minD = d;
+        }
+    });
+    return {vIndex: nearestIndex, distance: minD}
+}
+
+function getBoundingBox(verts) {
+    // the first is upperleft, the second is lowerright
+    let bound = [[],[]];
+    bound[0][0] = 1e9;
+    bound[0][1] = 1e9;
+    bound[1][0] = -1e9;
+    bound[1][1] = -1e9;
+    Object.entries(verts).forEach(([_, v]) => {
+        bound[0][0] = Math.min(bound[0][0], v.coordinates[0]);
+        bound[0][1] = Math.min(bound[0][1], v.coordinates[1]);
+        bound[1][0] = Math.max(bound[1][0], v.coordinates[0]);
+        bound[1][1] = Math.max(bound[1][1], v.coordinates[1]);
+    });
+    return bound;
+}
+
+function isIntersection(conn1, conn2) {
+    const a = vertices[conn1[0]].coordinates[0];
+    const b = vertices[conn1[0]].coordinates[1];
+    const c = vertices[conn1[1]].coordinates[0];
+    const d = vertices[conn1[1]].coordinates[1];
+    const p = vertices[conn2[0]].coordinates[0];
+    const q = vertices[conn2[0]].coordinates[1];
+    const r = vertices[conn2[1]].coordinates[0];
+    const s = vertices[conn2[1]].coordinates[1];
+    let det, gamma, lambda;
+    det = (c - a) * (s - q) - (r - p) * (d - b);
+    if (det === 0) {
+        return false;
+    } else {
+        lambda = ((s - q) * (r - a) + (p - r) * (s - b)) / det;
+        gamma = ((b - d) * (r - a) + (c - a) * (s - b)) / det;
+        return (0 < lambda && lambda < 1) && (0 < gamma && gamma < 1);
+    }
+}
+
+
+let celebrationPhase = 0;
+
+function celebrate() {
+    const totalDuration = 1000;
+    const startScale = scale;
+    const startOffset = [...offset];
+    let startTime = undefined;
+    function pertubate(timestamp) {
+        if (startTime === undefined) {
+            startTime = timestamp;
+        }
+        celebrationPhase = Math.min((timestamp - startTime) / totalDuration, 1);
+        scale = defaultScale * celebrationPhase + startScale * (1 - celebrationPhase);
+        offset[0] = defaultOffset[0] * celebrationPhase + startOffset[0] * (1 - celebrationPhase),
+        offset[1] = defaultOffset[1] * celebrationPhase + startOffset[1] * (1 - celebrationPhase)
+        drawVectorArt();
+        if (celebrationPhase < 1) {
+            requestAnimationFrame(pertubate);
+        }
+    }
+    requestAnimationFrame(pertubate);
+}
+
+function validateAndApplyConnect(vKey1, vKey2) {
+    const v1 = vertices[vKey1];
+    const v2 = vertices[vKey2];
+    const connection = [Number(vKey1), Number(vKey2)];
+    connection.sort();
+    const connKey = JSON.stringify(connection);
+
+    // don't allow vertex to connect to itself
+    if (v1 == v2) {
+        return false;
+    }
+
+    // don't allow crossing edges
+    let intersects = false;
+    Object.entries(connections).forEach(([connKey2, connection2]) => {
+        if (connKey == connKey2) {
+            return false;
+        }
+        if (isIntersection(connection, connection2)) {
+            intersects = true;
+            return false;
+        }
+    });
+    if (intersects) {
+        return false;
+    }
+
+    // don't allow vertices to have more connections than the solution needs
+    if ((v1.freeEdges <= 0) || (v2.freeEdges <=0)) {
+        return false;
+    }
+
+
+    // don't allow a connection where one already exists
+    if (connections.hasOwnProperty(connKey)) {
+        return false;
+    }
+
+    // congratulations, you are going to be a connection.
+    // A connection is removable until it is used to correctly solve a shape
+    connection.removable = true;
+    connections[connKey] = connection;
+    vertices[vKey1].freeEdges--;
+    vertices[vKey2].freeEdges--;
+
+    // see if this completes any shapes
+    // note this logic uses the simplifying assumption that shapes are triangles and being
+    // on the same triangle as another vertex is sufficient to imply an edge between them
+    const affectedShapeKeys = new Set(v1.shapes).intersection(new Set(v2.shapes));
+    affectedShapeKeys.forEach((shapeKey, _) => {
+        const edgesConnected = [];
+        const shape = shapes[shapeKey];
+        for (let i = 0; i < shape.vertices.length; ++i) {
+            const conn = [shape.vertices[i], shape.vertices[(i + 1) % shape.vertices.length]];
+            conn.sort();
+            const connKey = JSON.stringify(conn);
+            if (connections.hasOwnProperty(connKey)) {
+                edgesConnected.push(connKey);
+            }
+        }
+        if (edgesConnected.length == shape.vertices.length) {
+            completedShapeKeys.add(shapeKey);
+            for (const edgeKey of edgesConnected) {
+                connections[edgeKey].removable = false;
+            }
+        }
+        if (completedShapeKeys.size == Object.keys(shapes).length) {
+            celebrate();
+        }
+    });
+    return true;
+}
+
+// transform a client coordinate to a point in the canvas' transformed context
+// this needs to be improved when position:absolute isn't a canvas property. I
+// think its something to do with a misunderstanding where the bottom left boundary is.
+function getTransformedPoint(x, y) {
+    const canvasRect = canvas.getBoundingClientRect()
+    const originalPoint = new DOMPoint(x - canvasRect.left, y - canvasRect.top);
+    const coord = ctx.getTransform().invertSelf().transformPoint(originalPoint);
+    return [coord.x, coord.y];
+}
+
+function removeRemovableConnections(vIndex) {
+    const removableConns = getRemovableConnections(Number(vIndex));
+    removableConns.forEach((cIndex, _) => {
+        vertices[connections[cIndex][0]].freeEdges++;
+        vertices[connections[cIndex][1]].freeEdges++;
+        delete connections[cIndex];
+    });
+}
+
+function getSolutionNeighbors(vIndex) {
+    // return the set of vIndexes that will be neighbors to the requested vIndex in the correct puzzle solution.
+    const neighbors = new Set();
+    vertices[vIndex].shapes.forEach((sIndex, _) => {
+        const shape = shapes[sIndex];
+        shape.vertices.forEach((neighbor, nIndex) => {
+            neighbors.add(neighbor);
+        });
+    });
+    neighbors.delete(Number(vIndex));
+    return neighbors;
+}
+
+function getRemovableConnections(vIndex) {
+    // return a list of keys to removable connections that are to/from the vIndex
+    const removableConns = [];
+    Object.entries(connections).forEach(([connKey, conn]) => {
+        if (conn.includes(vIndex) && conn.removable) {
+            removableConns.push(connKey);
+        }
+    });
+    return removableConns;
+}
+
+const SCALE_MAX = 3;
+const SCALE_MIN = 0.45;
+
+function setScale(s) {
+    scale = s;
+    const tooBig = scale > SCALE_MAX * defaultScale;
+    const tooSmall = scale < SCALE_MIN * defaultScale;
+    if (tooBig) {
+        scale = SCALE_MAX * defaultScale;
+    }
+    if (tooSmall) {
+        scale = SCALE_MIN * defaultScale;
+    }
+    /*
+    document.getElementById('zoomInBtn').disabled = tooBig;
+    document.getElementById('zoomOutBtn').disabled = tooSmall;
+    */
+}
+/*
+document.getElementById('zoomInBtn').onclick = function() {
+    setScale(scale * 1.2);
+    drawVectorArt();
+}
+document.getElementById('zoomOutBtn').onclick = function() {
+    setScale(scale / 1.2);
+    drawVectorArt();
+}
+document.getElementById('zoom100').onclick = function() {
+    setScale(defaultScale);
+    drawVectorArt();
+}
+*/
+let lastWheelDraw = Date.now() - 10000;
+function thingWheel(e) {
+    setScale(scale * (100 - e.deltaY)/100);
+    e.preventDefault();
+    const now = Date.now();
+    // this event can happen at over 100 Hz
+    if (now >= lastWheelDraw + 33) {
+        drawVectorArt();
+        lastWheelDraw = now;
+    }
+}
+
+document.getElementById('resetPuzzle').onclick = function() {
+    deleteSaveData(puzzlePath);
+    doGame(puzzlePath);
+}
+
+function mousentouch(e) {
+    if (event.touches && event.touches.length === 1) {
+        return [event.touches[0].clientX, event.touches[0].clientY];
+    } else if (event.touches && event.touches.length === 2) {
+        return [(event.touches[0].clientX + event.touches[1].clientX)/2, (event.touches[0].clientY + event.touches[1].clientY)/2];
+    } else {
+        return [e.x, e.y];
+    }
+}
+function thingDown(e) {
+    const [x, y] = mousentouch(e);
+    pointerCoord = getTransformedPoint(x, y);
+    const {vIndex, distance} = findNearestVertex(pointerCoord);
+    if (e.touches && e.touches.length == 2) {
+        connect = false;
+        remove = false;
+        oldOffset = [...offset];
+        panOrigin = [x , y];
+    } else if (e.touches && e.touches.length > 2) {
+        // do nothing
+    } else if ((distance != null) && (distance < magnetDistance / scale)) {
+        // connectStartVIndex is used to remember the starting vertex in an ongoing connect user operation but
+        // its also used as a part of detecting double clicks
+        connectStartVIndex = vIndex;
+
+        // user could be initiating a connect or a remove operation. Set both for now.
+        remove = true;
+        if ((vIndex != null) && (vertices[vIndex].freeEdges > 0)) {
+            connect = true;
+        }
+    } else {
+        // user is initiating a pan operation
+        panOrigin = [x , y];
+        oldOffset = [...offset];
+        pan = true;
+    }
+    drawVectorArt();
+}
+
+
+function thingUp(e) {
+    lastTouchDistance = null;
+    if (!pointerCoord) {
+        return;
+    }
+    const {vIndex, distance} = findNearestVertex(pointerCoord);
+    if (distance < magnetDistance / scale) {
+        // detect if this is a double click
+        if (connectStartVIndex == vIndex) {
+            const now = Date.now();
+            if (remove) {
+                remove = false;
+                if ((vIndex == lastTapVertex) && (now - lastTapTime < 500)) {
+                    removeRemovableConnections(vIndex);
+                }
+            }
+            lastTapVertex = vIndex;
+            lastTapTime = now;
+        } else {
+            // user has completed a connect operation
+            if (connect) {
+                validateAndApplyConnect(connectStartVIndex, vIndex);
+                savePuzzleState();
+            }
+        }
+    }
+    connect = false;
+    pan = false;
+    drawVectorArt();
+}
+
+function thingMove(e) {
+    const [x, y] = mousentouch(e);
+    pointerCoord = getTransformedPoint(x, y);
+
+    if (e.type === "touchmove") {
+        e.preventDefault();
+    }
+
+    if (e.touches && e.touches.length == 2) {
+        // its pinch n zoom time, brotha
+        const currentDistance = distance(
+            [e.touches[0].clientX, e.touches[0].clientY],
+            [e.touches[1].clientX, e.touches[1].clientY]);
+        const [x, y] = mousentouch(e);
+
+        if (lastTouchDistance !== null) {
+            const scaleChange = currentDistance / lastTouchDistance;
+            setScale(scale * scaleChange);
+            offset[0] = oldOffset[0] + (x - panOrigin[0]);
+            offset[1] = oldOffset[1] + (y - panOrigin[1]);
+        }
+        lastTouchDistance = currentDistance;
+    } else if(pan) {
+        offset[0] = oldOffset[0] + (x - panOrigin[0]) / scale;
+        offset[1] = oldOffset[1] + (y - panOrigin[1]) / scale;
+    } else {
+        const {vIndex, distance} = findNearestVertex(pointerCoord);
+        if (distance < magnetDistance / scale) {
+            overVIndex = vIndex;
+            console.log("You are looking at vertex ", overVIndex);
+        } else {
+            overVIndex = null;
+        }
+    }
+    drawVectorArt();
+}
+
+function thingOut(e) {
+    pan = false;
+}
+
+window.onresize = function(e) {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    if (puzzlePath) {
+        drawVectorArt();
+    }
+};
+
+
+// Function to draw vector art on the canvas
+function drawVectorArt() {
+    const ppp = 2; // (5 + window.devicePixelRatio) / 5;
+    ctx.reset();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // translate, scale, and rotate aren't settings but operations.
+    // translate then scale isn't the same as scale then translate.
+    // We are going to translate the canvas center to (0, 0), scale, then translate it back to where it was.
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.scale(scale, scale);
+    ctx.translate(-canvas.width / 2, -canvas.height / 2);
+    //console.log("Offset and scale", offset, scale);
+
+    // translate based on panning
+    ctx.translate(offset[0], offset[1]);
+
+
+    // draw completed triangles
+    ctx.lineWidth = celebrationPhase + 1 / scale;
+    ctx.lineJoin = "round";
+    completedShapeKeys.forEach((shapeKey, _) => {
+        ctx.beginPath();
+        const shape = shapes[shapeKey];
+        ctx.fillStyle = palette[shape.color];
+        ctx.strokeStyle = palette[shape.color];
+        shape.vertices.forEach((vertexKey, index) => {
+            const vertex = vertices[vertexKey];
+            if (index === 0) {
+                ctx.moveTo(vertex.coordinates[0], vertex.coordinates[1]);
+            } else {
+                ctx.lineTo(vertex.coordinates[0], vertex.coordinates[1]);
+            }
+        });
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+    });
+
+    // draw connections
+    ctx.beginPath();
+    ctx.strokeStyle = "rgba(0, 0, 0, " + String(1 - celebrationPhase) + ")";
+    /*
+    if (celebrationPhase > 0) {
+        // this is the same as "black" at phase 0, but *I think* performance is worse when alpha is specified
+        ctx.strokeStyle = "rgba(0, 0, 0, " + String(1 - celebrationPhase) + ")";
+    } else {
+        ctx.strokeStyle = "black";
+    }
+    */
+    ctx.lineWidth = 0.7 / scale;
+    Object.entries(connections).forEach(([_, conn]) => {
+        ctx.beginPath();
+        ctx.moveTo(vertices[conn[0]].coordinates[0], vertices[conn[0]].coordinates[1]);
+        ctx.lineTo(vertices[conn[1]].coordinates[0], vertices[conn[1]].coordinates[1]);
+        ctx.closePath();
+        ctx.stroke();
+    });
+
+   // draw vertex circle on ones that are a part of an incomplete shape
+   ctx.beginPath();
+    Object.entries(vertices).forEach(([vIndex, vertex]) => {
+        let vertexComplete = true;
+        for (shape of vertex.shapes) {
+            if (!completedShapeKeys.has(shape)) {
+                vertexComplete = false;
+                break;
+            }
+        }
+        if (!vertexComplete) {
+            const connecting = (connect && (vIndex == overVIndex || vIndex == connectStartVIndex));
+
+            // thick main vertex circle
+            ctx.lineWidth = 1.2 / scale;
+            if (connecting) {
+                ctx.strokeStyle = "orange";
+                ctx.fillStyle = "orange";
+            } else {
+                ctx.strokeStyle = "black";
+                ctx.fillStyle = (vIndex == overVIndex) ? "black" : "white";
+            }
+            ctx.beginPath();
+            ctx.arc(vertices[vIndex].coordinates[0], vertices[vIndex].coordinates[1], (6 + 2 * Math.max(vertex.freeEdges, 3))/(scale * ppp), 0, 2 * Math.PI, false);
+            ctx.fill();
+            ctx.stroke();
+
+            // mini dotted vertex circle
+            ctx.save();
+            ctx.lineWidth = 0.5 / scale;
+            ctx.setLineDash([0.5 * Math.PI / scale, .5 * Math.PI / scale]);
+            if (connecting) {
+                ctx.strokeStyle = "orange";
+            } else {
+                ctx.strokeStyle = "black";
+            }
+            ctx.beginPath();
+            ctx.arc(vertices[vIndex].coordinates[0], vertices[vIndex].coordinates[1], (10 + 2 * Math.max(vertex.freeEdges, 3))/(scale * ppp), 0, 2 * Math.PI, false);
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // vertex free edge number
+        // draw numbers on vertices that are not complete or can have at least one removed
+        const hasRemovable = getRemovableConnections(Number(vIndex)).length != 0;
+        if (vertex.freeEdges || hasRemovable) {
+            if (vertex.freeEdges) {
+                ctx.fillStyle = (vIndex == overVIndex && !connect) ? "white" : "black";
+                ctx.font =  (18 / (scale * ppp)) + "px sans-serif";
+                ctx.textAlign = "center";
+                ctx.fillText(vertex.freeEdges, vertices[vIndex].coordinates[0], vertices[vIndex].coordinates[1] + 4/scale);
+            }
+        }
+    });
+
+    // draw in-progress connection
+    if (connect) {
+        ctx.setLineDash([0.5 * Math.PI / scale, .5 * Math.PI / scale]);
+        ctx.strokeStyle = "orange";
+        ctx.fillStyle = "orange";
+        ctx.lineWidth = 1 / scale;
+
+        // cursor circle
+        ctx.beginPath();
+        ctx.arc(pointerCoord[0], pointerCoord[1], 6 / scale, 0, 2 * Math.PI, false);
+        ctx.fill();
+
+        // magnet circle
+        ctx.beginPath();
+        ctx.arc(pointerCoord[0], pointerCoord[1], 15 / scale, 0, 2 * Math.PI, false);
+        ctx.stroke();
+
+        // connection line
+        ctx.beginPath();
+        ctx.moveTo(vertices[connectStartVIndex].coordinates[0], vertices[connectStartVIndex].coordinates[1]);
+        ctx.lineTo(pointerCoord[0], pointerCoord[1]);
+        ctx.closePath();
+        ctx.stroke();
+    }
+}
+
+async function retrievePuzzle(url) {
+    const response = await fetch(url);
+    if (url.startsWith('puzzles/')) {
+        return response.json();
+    } else {
+        const meta = await response.json();
+        return JSON.parse(atob(meta.content));
+    }
+
+    if (!response.ok) {
+        throw new Error('Failed to fetch vector art data');
+    }
+}
+
+function setTheme(theme) {
+    const themeDiv = document.getElementById("puzzleTheme");
+    themeDiv.innerHTML = theme;
+}
+
+let firstTime = true;
+// yeeeaaahh do game do game!
+async function doGame(puzzleUrl) {
+    const puzzle = await retrievePuzzle(puzzleUrl);
+    vertices = puzzle.vertices;
+    shapes = puzzle.shapes;
+    palette = puzzle.palette;
+    setTheme(puzzle.theme);
+    celebrationPhase = 0;
+
+    // set free edges for easy lookup
+    Object.entries(vertices).forEach(([vIndex, vertex]) => {
+        vertex.freeEdges = getSolutionNeighbors(vIndex).size;
+    });
+
+    // have canvas fit the window
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    // center the art in the canvas
+    const bounds = getBoundingBox(vertices);
+    const artMidwayFromOrigin = [(bounds[1][0] + bounds[0][0])/2, (bounds[1][1] + bounds[0][1])/2];
+    offset[0] = canvas.width / 2 - artMidwayFromOrigin[0];
+    offset[1] = canvas.height / 2 - artMidwayFromOrigin[1];
+    defaultOffset = [...offset];
+
+    // frame the art within the canvases bounds
+    const artMidwayFromSelf = [
+        (bounds[1][0] + bounds[0][0]) / 2 - bounds[0][0],
+        (bounds[1][1] + bounds[0][1]) / 2 - bounds[0][1]
+    ];
+    const whitespaceRatio = 0.7;
+    scale = whitespaceRatio * Math.min(canvas.width / (2 * artMidwayFromSelf[0]), canvas.height / (2 * artMidwayFromSelf[1]));
+    defaultScale = scale;
+
+    completedShapeKeys = new Set();
+    connections = {};
+    // connect shapes that are supposed to already be connected
+    for (const shape of shapes) {
+        if (shape.isPreDrawn) {
+            validateAndApplyConnect(shape.vertices[0], shape.vertices[1]);
+            validateAndApplyConnect(shape.vertices[1], shape.vertices[2]);
+            validateAndApplyConnect(shape.vertices[2], shape.vertices[0]);
+        }
+    }
+
+    // load up the game save state if it exists
+    loadPuzzleState(puzzleUrl);
+
+    // The user operations that can be underway
+    pan = false;
+    connect = false;
+    remove = false;
+    oldOffset = null;
+    // state needed during user operations
+    panOrigin = null; // where the cursor started on a pan
+    pointerCoord = null; // where the cursor currently is (not calced during pan, but only because it would have no effect)
+    connectStartVIndex = null; // which vertex started on a connect
+    lastTapVertex = null;
+    lastTapTime = Date.now() - 10000;
+    lastTouchDistance = null;
+
+    drawVectorArt();
+
+    if (firstTime) {
+        firstTime = false;
+        canvas.addEventListener("mousedown", thingDown);
+        canvas.addEventListener("mouseup", thingUp);
+        canvas.addEventListener("mousemove", thingMove);
+        canvas.addEventListener("mouseout", thingOut);
+        canvas.addEventListener("wheel", thingWheel);
+        canvas.addEventListener("touchstart", thingDown);
+        canvas.addEventListener("touchend", thingUp);
+        canvas.addEventListener("touchmove", thingMove);
+    }
+}
+
+async function loadPuzzleOptionsLocal() {
+    const url = 'puzzles.json'
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error('Failed to fetch level options metadata');
+    }
+    return response.json();
+}
+
+async function loadPuzzleOptionsRemote() {
+    const response = await fetch('https://api.github.com/repos/Q726kbXuN/vertex/git/trees/master?recursive=1'); // THANK YOU
+    const data = await response.json();
+    const puzzles = data.tree.filter((file) => file.path.startsWith('data/'));
+    let ret = [];
+    puzzles.reverse().forEach((puzzle)  => {
+        try {
+            const filename = puzzle.path.split('/')[3];
+            const puzzledate = filename.split('.')[0];
+            let p = {}
+            p.path = puzzle.url;
+            p.date = puzzledate;
+            ret.push(p);
+        } catch (e) {};
+    });
+    return ret;
+}
+
+function setPuzzleSelector(options) {
+    const selectorDiv = document.getElementById("puzzleSelectorDiv");
+    let select = document.createElement('select');
+    select.id = "puzzleSelector";
+    {
+        let opt = document.createElement('option');
+        opt.value = null;
+        opt.innerHTML = "Select puzzle";
+        select.appendChild(opt);
+    }
+    options.sort((a, b) => {
+        const adate = new Date(a.date);
+        const bdate = new Date(b.date);
+        return adate < bdate;
+    });
+    for (let i = 0; i < options.length; ++i) {
+        const option = options[i];
+        let opt = document.createElement('option');
+        opt.value = option.path;
+        const theme = option.theme === undefined ? "" : ": " + option.theme;
+        opt.innerHTML = option.date + theme;
+        select.appendChild(opt);
+        if (i > 5000) {
+            break;
+        }
+    }
+    select.onchange = (e) => {
+        const puzzle = select.options[select.selectedIndex].value;
+        if (puzzle != "") {
+            doGame(puzzle);
+        }
+    }
+
+    selectorDiv.appendChild(select);
+}
+window.onload = async function() {
+    const localPuzzles = await loadPuzzleOptionsLocal();
+    const remotePuzzles = await loadPuzzleOptionsRemote();
+    const puzzles = localPuzzles.concat(remotePuzzles);
+    enrichWithSaveState(puzzles);
+    setPuzzleSelector(puzzles);
+}
+
+function enrichWithSaveState(puzzlesMeta) {
+    for (puzzle of puzzlesMeta) {
+        const cookie = getCookie(puzzle.path);
+        if (cookie) {
+            try {
+                const cdata = JSON.parse(cookie);
+            } catch (e) {
+                console.log("Couldn't parse cookie for", puzzle.path);
+                console.log("Deleting cookie for", puzzle.path);
+                deleteSaveData(puzzle.Path);
+                continue;
+            }
+            // TODO
+        }
+    }
+}
+
+
+function loadPuzzleState(path) {
+    puzzlePath = path;
+    try {
+        const conns = JSON.parse(localStorage.getItem(path));
+        Object.entries(conns).forEach(([_, conn]) => {
+            validateAndApplyConnect(conn[0], conn[1]);
+        });
+    } catch (e) {
+        console.log("could not load puzzle state");
+    }
+}
+
+function savePuzzleState() {
+    localStorage.setItem(puzzlePath, JSON.stringify(connections));
+}
+
+function resetPuzzleState() {
+    localStorage.removeItem(puzzlePath);
+}
+
+// Cookies no longer used, limited to 4k
+function setCookie(cname, cvalue, exdays) {
+    const d = new Date();
+    d.setTime(d.getTime() + (exdays * 24 * 60 * 60 * 1000));
+    let expires = "expires="+d.toUTCString();
+    document.cookie = cname + "=" + cvalue + ";" + expires + ";path=/";
+}
+
+function deleteCookie(cname) {
+    document.cookie = cname + "=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+}
+
+function getCookie(cname) {
+    let name = cname + "=";
+    let ca = document.cookie.split(';');
+    for (let i = 0; i < ca.length; i++) {
+        let c = ca[i];
+        while (c.charAt(0) == ' ') {
+            c = c.substring(1);
+        }
+        if (c.indexOf(name) == 0) {
+            return c.substring(name.length, c.length);
+        }
+    }
+    return "";
+}
+
+function deleteAllCookies() {
+    const cookies = document.cookie.split(";");
+    for (let i = 0; i < cookies.length; i++) {
+        const cookie = cookies[i];
+        const eqPos = cookie.indexOf("=");
+        const name = eqPos > -1 ? cookie.substr(0, eqPos) : cookie;
+        deleteCookie(name);
+    }
+}
+
+</script>
+</body>
+</html>
